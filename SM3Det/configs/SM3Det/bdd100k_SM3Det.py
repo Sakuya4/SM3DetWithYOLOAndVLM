@@ -288,7 +288,8 @@ gpus = 8
 batch_size = sum(source_ratio)
 # evaluation
 
-evaluation = dict(interval=total_images//(batch_size*gpus), metric='bbox',classwise=True)
+# evaluation = dict(interval=total_images//(batch_size*gpus), metric='bbox',classwise=True)
+evaluation = dict(interval=1000, metric='bbox')
 evaluation2 = dict(interval=total_images//(batch_size*gpus), metric='mAP') 
 evaluation3 = dict(interval=total_images//(batch_size*gpus), metric='mAP') 
 
