@@ -1,0 +1,6 @@
+yolov3.cfg
+yolov3.weights
+coco.names
+
+
+https://drive.google.com/drive/folders/1Ock6xbQVnX2iFswrTX86zrdP4BcQcF1q?usp=sharing
