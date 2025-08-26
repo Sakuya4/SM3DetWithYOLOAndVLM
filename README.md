@@ -1,4 +1,5 @@
-# SM3DetWithYOLOAndVLM
+# solveillegalparkingbyVLM
+### 2025高通台灣AI黑客松比賽題目
 YOLO做車輛檢測，經過NAFNet的模糊處理，最後提供給VLM去判斷是否違規
 
 如果畫面無法辨識(Bad case)，會由SM3Det介入協助影像處理
