@@ -6,11 +6,15 @@ from datetime import datetime
 from pathlib import Path
 from ultralytics import YOLO
 from typing import Optional, Dict, List
+from detector import UltralyticsDetector, Detection
+from tracker import ByteTrackTracker, Track
 import logging
+from PySide6.QtCore import QObject, Signal
 
 logger = logging.getLogger(__name__)
 
-class WebcamStreamProcessor:
+class WebcamStreamProcessor(QObject):
+    auto_upload_signal = Signal(dict)
     def __init__(self, camera_index: int = 0, yolo_weights: str = "yolov8n.pt"):
         self.camera_index = camera_index
         self.yolo_weights = yolo_weights
@@ -25,7 +29,32 @@ class WebcamStreamProcessor:
         self.output_dir.mkdir(exist_ok=True)
         self.yolo_model = None
         self.last_annotated_frame = None
-        self._load_yolo_model()
+        self.detector: Optional[UltralyticsDetector] = None
+        self.tracker: Optional[ByteTrackTracker] = ByteTrackTracker()
+        self.track_first_seen: Dict[int, float] = {}
+        self.last_tracks: List[Track] = []
+        self._load_detector()
+
+    def _draw_box_with_label(self, img, bbox, label, color=(0, 255, 0), box_thickness=2):
+        x1, y1, x2, y2 = bbox
+        h, w = img.shape[:2]
+        font_scale = max(0.6, min(1.2, w / 1280.0 * 0.9))
+        text_thickness = max(1, int(round(font_scale * 2)))
+
+        cv2.rectangle(img, (x1, y1), (x2, y2), color, box_thickness)
+
+        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, text_thickness)
+        th_full = th + 8
+        x2_bg = min(w - 1, x1 + tw + 10)
+        y1_bg = max(0, y1 - th_full - 2)
+
+        overlay = img.copy()
+        cv2.rectangle(overlay, (x1, y1_bg), (x2_bg, y1), color, -1)
+        cv2.addWeighted(overlay, 0.6, img, 0.4, 0, img)
+
+        tx, ty = x1 + 5, y1 - 6
+        cv2.putText(img, label, (tx + 1, ty + 1), cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 0, 0), text_thickness, cv2.LINE_AA)
+        cv2.putText(img, label, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), text_thickness, cv2.LINE_AA)
     
     def _load_yolo_model(self):
         try:
@@ -37,12 +66,23 @@ class WebcamStreamProcessor:
             logger.error(f"載入 YOLO 模型失敗: {e}")
             self.yolo_model = None
             return False
+
+    def _load_detector(self):
+        try:
+            logger.info(f"正在載入偵測模型: {self.yolo_weights}")
+            self.detector = UltralyticsDetector(self.yolo_weights)
+            logger.info(f"成功載入偵測模型: {self.yolo_weights}")
+            return True
+        except Exception as e:
+            logger.error(f"載入偵測模型失敗: {e}")
+            self.detector = None
+            return False
     
     def start_stream(self) -> bool:
         try:
-            if self.yolo_model is None:
-                if not self._load_yolo_model():
-                    logger.error("無法載入 YOLO 模型，無法啟動串流")
+            if self.detector is None:
+                if not self._load_detector():
+                    logger.error("無法載入偵測模型，無法啟動串流")
                     return False
             
             self.cap = cv2.VideoCapture(self.camera_index)
@@ -59,7 +99,7 @@ class WebcamStreamProcessor:
             self.detection_thread.start()
             
             logger.info(f"成功啟動網路攝影機串流 (攝影機 {self.camera_index})")
-            logger.info(f"YOLO 就緒，開始車輛偵測")
+            logger.info(f"偵測模型就緒，開始車輛偵測")
             return True
             
         except Exception as e:
@@ -95,81 +135,65 @@ class WebcamStreamProcessor:
                 time.sleep(0.5)
     
     def _detect_vehicles(self, frame):
-        if self.yolo_model is None:
-            logger.warning("YOLO 模型未載入，跳過偵測")
+        if self.detector is None:
+            logger.warning("偵測模型未載入，跳過偵測")
             return
         
         try:
-            results = self.yolo_model.predict(
-                source=frame, 
-                imgsz=640, 
-                conf=self.detection_threshold, 
-                verbose=False
-            )
+            detections: List[Detection] = self.detector.detect(frame)
             
             current_time = time.time()
-            detected_vehicles = []
+            detected_track_ids: List[int] = []
             detection_count = 0
             
             annotated_frame = frame.copy()
             
-            for r in results:
-                if hasattr(r, 'boxes'):
-                    for box in r.boxes:
-                        xyxy = box.xyxy[0].cpu().numpy()
-                        conf = float(box.conf[0].cpu().numpy())
-                        cls = int(box.cls[0].cpu().numpy())
-                        cls_name = r.names.get(cls, str(cls)).lower()
-                        
-                        if detection_count < 3:
-                            logger.debug(f"偵測到物件: {cls_name}, 置信度: {conf:.2f}")
-                        
-                        x1, y1, x2, y2 = map(int, xyxy)
-                        
-                        if cls_name in self.vehicle_classes:
-                            color = (0, 255, 0)
-                            thickness = 2
-                        else:
-                            color = (128, 128, 128)
-                            thickness = 1
-                        
-                        cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), color, thickness)
-                        
-                        label = f"{cls_name} {conf:.2f}"
-                        label_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)[0]
-                        cv2.rectangle(annotated_frame, (x1, y1 - label_size[1] - 10), 
-                                    (x1 + label_size[0], y1), color, -1)
-                        cv2.putText(annotated_frame, label, (x1, y1 - 5), 
-                                  cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-                        
-                        if cls_name in self.vehicle_classes:
-                            vehicle_id = f"{cls_name}_{x1}_{y1}"
-                            
-                            if vehicle_id not in self.vehicle_detection_time:
-                                self.vehicle_detection_time[vehicle_id] = current_time
-                                logger.info(f"偵測到新車輛: {cls_name} (ID: {vehicle_id}, 置信度: {conf:.2f})")
-                            
-                            detection_duration = current_time - self.vehicle_detection_time[vehicle_id]
-                            
-                            if detection_duration >= self.auto_upload_duration:
-                                self._auto_upload_frame(annotated_frame, vehicle_id, cls_name, conf, detection_duration)
-                                self.vehicle_detection_time[vehicle_id] = current_time
-                            
-                            detected_vehicles.append(vehicle_id)
-                        
-                        detection_count += 1
+            # 先過濾低於門檻的偵測，再送追蹤器
+            filt_dets = [d for d in detections if d.confidence >= self.detection_threshold]
+            tracks: List[Track] = self.tracker.update(filt_dets, current_time)
+            self.last_tracks = tracks
+
+            for tr in tracks:
+                x1, y1, x2, y2 = tr.bbox
+                cls_name = tr.cls_name.lower()
+                conf = tr.score
+                detected_track_ids.append(tr.track_id)
+
+                if detection_count < 3:
+                    logger.debug(f"偵測到物件: {cls_name}#{tr.track_id}, 置信度: {conf:.2f}")
+
+                if cls_name in self.vehicle_classes:
+                    color = (0, 255, 0)
+                    thickness = 2
+                else:
+                    color = (128, 128, 128)
+                    thickness = 1
+
+                label = f"{cls_name}#{tr.track_id} {conf:.2f}"
+                self._draw_box_with_label(annotated_frame, (x1, y1, x2, y2), label, color, thickness)
+
+                if cls_name in self.vehicle_classes:
+                    if tr.track_id not in self.track_first_seen:
+                        self.track_first_seen[tr.track_id] = current_time
+                        logger.info(f"偵測到新車輛: {cls_name} (Track: {tr.track_id}, 置信度: {conf:.2f})")
+
+                    detection_duration = current_time - self.track_first_seen[tr.track_id]
+                    if detection_duration >= self.auto_upload_duration:
+                        self._auto_upload_frame(annotated_frame, f"track_{tr.track_id}", cls_name, conf, detection_duration)
+                        self.track_first_seen[tr.track_id] = current_time
+
+                detection_count += 1
             
-            current_vehicles = set(detected_vehicles)
-            expired_vehicles = [vid for vid in self.vehicle_detection_time.keys() 
-                              if vid not in current_vehicles and 
-                              current_time - self.vehicle_detection_time[vid] > 5.0]
-            
-            for vid in expired_vehicles:
-                del self.vehicle_detection_time[vid]
-                logger.info(f"車輛 {vid} 已離開畫面")
+            current_ids = set(detected_track_ids)
+            expired_ids = [tid for tid in list(self.track_first_seen.keys())
+                           if tid not in current_ids and (current_time - self.track_first_seen[tid] > 5.0)]
+
+            for tid in expired_ids:
+                del self.track_first_seen[tid]
+                logger.info(f"車輛 Track {tid} 已離開畫面")
             
             if detection_count > 0 and time.time() % 10 < 0.1:
-                logger.info(f"偵測狀態: 總物件 {detection_count}, 活躍車輛 {len(detected_vehicles)}")           
+                logger.info(f"偵測狀態: 總物件 {detection_count}, 活躍車輛 {len(detected_track_ids)}")           
             self.last_annotated_frame = annotated_frame
                 
         except Exception as e:
@@ -197,8 +221,7 @@ class WebcamStreamProcessor:
             logger.info(f"自動上傳車輛影像: {filename}")
             logger.info(f"車輛資訊: {vehicle_type}, 置信度: {confidence:.2f}, 持續時間: {duration:.1f}秒")
             
-            if hasattr(self, 'on_auto_upload'):
-                self.on_auto_upload(upload_info)
+            self.auto_upload_signal.emit(upload_info)
                 
         except Exception as e:
             logger.error(f"自動上傳影像失敗: {e}")
@@ -219,8 +242,7 @@ class WebcamStreamProcessor:
                 return frame
         return None
     
-    def set_auto_upload_callback(self, callback_func):
-        self.on_auto_upload = callback_func
+
     
     def get_detection_stats(self) -> Dict:
         current_time = time.time()
@@ -334,30 +356,23 @@ class WebcamStreamProcessor:
     
     def test_yolo_model(self) -> bool:
         try:
-            if self.yolo_model is None:
-                logger.warning("YOLO 模型未載入，嘗試重新載入...")
-                if not self._load_yolo_model():
+            if self.detector is None:
+                logger.warning("偵測模型未載入，嘗試重新載入...")
+                if not self._load_detector():
                     return False
-            
+
             test_image = np.zeros((640, 640, 3), dtype=np.uint8)
-            
-            results = self.yolo_model.predict(
-                source=test_image,
-                imgsz=640,
-                conf=0.1,
-                verbose=False
-            )
-            
-            logger.info("YOLO 模型測試成功")
+            _ = self.detector.detect(test_image)
+            logger.info("偵測模型測試成功")
             return True
             
         except Exception as e:
-            logger.error(f"YOLO 模型測試失敗: {e}")
+            logger.error(f"偵測模型測試失敗: {e}")
             return False
     
     def get_yolo_status(self) -> Dict:
         return {
-            "model_loaded": self.yolo_model is not None,
+            "model_loaded": self.detector is not None,
             "model_path": self.yolo_weights,
             "detection_threshold": self.detection_threshold,
             "vehicle_classes": self.vehicle_classes
