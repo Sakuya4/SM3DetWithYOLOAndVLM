@@ -30,7 +30,6 @@ OUTPUT_DIR = Path("outputs")
 OUTPUT_DIR.mkdir(exist_ok=True)
 
 
-
 def detect_red_lines(img):
     hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
     lower_red1 = np.array([0, 120, 120])
@@ -114,7 +113,6 @@ class DetectionWorker(QThread):
                 cls_name = labels.get(cls, str(cls)).lower()
                 crop = img[int(y1):int(y2), int(x1):int(x2)]
 
-                # 判斷違規
                 overlapped, ratio = self.bbox_hits_redline(
                     (x1, y1, x2, y2), mask, band_px=30, min_ratio=0.005
                 )
@@ -185,11 +183,10 @@ class MainWindow(QWidget):
         self.debug_mask = True
         self.detailed_analysis = False
         
-        # 網路攝影機相關
         self.webcam_processor = None
         self.webcam_running = False
         self.webcam_frame = None
-        self.show_detection_boxes = True  # 是否顯示偵測框
+        self.show_detection_boxes = True
 
         self.image_label = QLabel("(No image)")
         self.image_label.setAlignment(Qt.AlignCenter)
@@ -243,7 +240,6 @@ class MainWindow(QWidget):
         right_layout.addWidget(btn_memory_monitor)
         right_layout.addWidget(btn_clear_memory)
         
-        # 網路攝影機按鈕
         right_layout.addWidget(btn_start_webcam)
         right_layout.addWidget(btn_stop_webcam)
         right_layout.addWidget(btn_webcam_settings)
@@ -377,7 +373,6 @@ class MainWindow(QWidget):
             QMessageBox.critical(self, "錯誤", f"記憶體清理失敗: {e}")
 
     def on_start_webcam(self):
-        """啟動網路攝影機"""
         try:
             if self.webcam_running:
                 QMessageBox.information(self, "提醒", "網路攝影機已在運行中")
@@ -385,26 +380,22 @@ class MainWindow(QWidget):
             
             self.log("正在啟動網路攝影機...")
             
-            # 創建網路攝影機處理器
             self.webcam_processor = WebcamStreamProcessor(
-                camera_index=0,  # 預設使用第一個攝影機
+                camera_index=0,
                 yolo_weights=self.yolo_weights
             )
             
-            # 設定自動上傳回調
-            self.webcam_processor.set_auto_upload_callback(self.on_webcam_auto_upload)
+            self.webcam_processor.auto_upload_signal.connect(self.on_webcam_auto_upload)
             
-            # 啟動串流
             if self.webcam_processor.start_stream():
                 self.webcam_running = True
-                self.log("✅ 網路攝影機啟動成功！")
+                self.log("網路攝影機啟動成功！")
                 self.log("正在進行即時車輛偵測...")
                 
-                # 開始定時更新畫面
                 self._start_webcam_display()
                 
             else:
-                self.log("❌ 網路攝影機啟動失敗")
+                self.log("網路攝影機啟動失敗")
                 QMessageBox.critical(self, "錯誤", "無法啟動網路攝影機，請檢查設備連接")
                 
         except Exception as e:
@@ -412,7 +403,6 @@ class MainWindow(QWidget):
             QMessageBox.critical(self, "錯誤", f"啟動失敗: {e}")
 
     def on_stop_webcam(self):
-        """停止網路攝影機"""
         try:
             if not self.webcam_running:
                 QMessageBox.information(self, "提醒", "網路攝影機未在運行")
@@ -425,29 +415,25 @@ class MainWindow(QWidget):
                 self.webcam_processor = None
             
             self.webcam_running = False
-            self.log("✅ 網路攝影機已停止")
+            self.log("網路攝影機已停止")
             
-            # 恢復預設畫面
             self.image_label.setText("(No image)")
             
         except Exception as e:
             self.log(f"停止網路攝影機時發生錯誤: {e}")
 
     def on_webcam_settings(self):
-        """網路攝影機設定"""
         try:
             if not self.webcam_processor:
                 QMessageBox.warning(self, "提醒", "請先啟動網路攝影機")
                 return
             
-            # 使用 webcam_stream 模組的功能
             self._show_webcam_settings_dialog()
             
         except Exception as e:
             self.log(f"網路攝影機設定失敗: {e}")
 
     def _show_webcam_settings_dialog(self):
-        """顯示網路攝影機設定對話框"""
         from PySide6.QtWidgets import QInputDialog, QDialog, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QSpinBox, QDoubleSpinBox
         
         dialog = QDialog(self)
@@ -456,14 +442,12 @@ class MainWindow(QWidget):
         
         layout = QVBoxLayout()
         
-        # 攝影機資訊
         camera_info = self.webcam_processor.get_camera_info()
         info_label = QLabel(f"攝影機狀態: {camera_info.get('status', '未知')}")
         if 'resolution' in camera_info:
             info_label.setText(f"攝影機狀態: {camera_info['status']}\n解析度: {camera_info['resolution']}\nFPS: {camera_info['fps']}")
         layout.addWidget(info_label)
         
-        # 自動上傳時間設定
         duration_layout = QHBoxLayout()
         duration_layout.addWidget(QLabel("自動上傳持續時間 (秒):"))
         duration_spin = QDoubleSpinBox()
@@ -473,7 +457,6 @@ class MainWindow(QWidget):
         duration_layout.addWidget(duration_spin)
         layout.addLayout(duration_layout)
         
-        # 偵測閾值設定
         threshold_layout = QHBoxLayout()
         threshold_layout.addWidget(QLabel("偵測閾值:"))
         threshold_spin = QDoubleSpinBox()
@@ -484,7 +467,6 @@ class MainWindow(QWidget):
         threshold_layout.addWidget(threshold_spin)
         layout.addLayout(threshold_layout)
         
-        # 按鈕
         button_layout = QHBoxLayout()
         
         btn_apply = QPushButton("套用設定")
@@ -510,7 +492,6 @@ class MainWindow(QWidget):
         dialog.exec()
 
     def _apply_webcam_settings(self, duration: float, threshold: float, dialog):
-        """套用網路攝影機設定"""
         try:
             self.webcam_processor.set_auto_upload_duration(duration)
             self.webcam_processor.set_detection_threshold(threshold)
@@ -520,7 +501,6 @@ class MainWindow(QWidget):
             self.log(f"套用設定失敗: {e}")
 
     def _show_webcam_stats(self):
-        """顯示網路攝影機統計"""
         try:
             summary = self.webcam_processor.get_vehicle_detection_summary()
             QMessageBox.information(self, "網路攝影機統計", summary)
@@ -528,7 +508,6 @@ class MainWindow(QWidget):
             self.log(f"顯示統計失敗: {e}")
 
     def _reset_webcam_counters(self):
-        """重置網路攝影機計數器"""
         try:
             self.webcam_processor.reset_detection_counters()
             self.log("已重置車輛偵測計數器")
@@ -536,7 +515,6 @@ class MainWindow(QWidget):
             self.log(f"重置計數器失敗: {e}")
 
     def _manual_capture(self):
-        """手動拍攝照片"""
         try:
             if not self.webcam_running:
                 QMessageBox.warning(self, "提醒", "請先啟動網路攝影機")
@@ -552,16 +530,13 @@ class MainWindow(QWidget):
             self.log(f"手動拍攝失敗: {e}")
 
     def on_test_yolo(self):
-        """測試 YOLO 模型"""
         try:
             if not self.webcam_processor:
-                # 創建一個臨時的處理器來測試
                 self.webcam_processor = WebcamStreamProcessor(
                     camera_index=0,
                     yolo_weights=self.yolo_weights
                 )
             
-            # 獲取 YOLO 狀態
             status = self.webcam_processor.get_yolo_status()
             
             status_text = f"""
@@ -574,10 +549,8 @@ class MainWindow(QWidget):
 正在測試模型...
 """
             
-            # 顯示狀態
             QMessageBox.information(self, "YOLO 狀態", status_text)
             
-            # 執行測試
             if self.webcam_processor.test_yolo_model():
                 self.log("YOLO 模型測試成功！")
                 QMessageBox.information(self, "測試結果", "YOLO 模型測試成功！")
@@ -590,7 +563,6 @@ class MainWindow(QWidget):
             QMessageBox.critical(self, "錯誤", f"測試失敗: {e}")
 
     def on_toggle_display(self):
-        """切換顯示模式（偵測框/原始畫面）"""
         if not self.webcam_running:
             QMessageBox.warning(self, "提醒", "請先啟動網路攝影機")
             return
