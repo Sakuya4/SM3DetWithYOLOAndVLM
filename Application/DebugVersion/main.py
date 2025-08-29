@@ -55,7 +55,7 @@ class DetectionWorker(QThread):
         self.yolo_weights = yolo_weights
         self.vlm_enabled = vlm_enabled
         self.debug_mask = debug_mask
-        self.detailed_analysis = detailed_analysis
+        self.detailed_analysis = True
 
     def bbox_hits_redline(self, bbox, red_mask, band_px=30, min_ratio=0.005):
         x1, y1, x2, y2 = map(int, bbox)
@@ -126,28 +126,55 @@ class DetectionWorker(QThread):
                     try:
                         pil_crop = Image.fromarray(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB))
                         
-                        if self.detailed_analysis:
-                            detailed_result = vlm.detailed_analysis(pil_crop)
-                            caption = vlm.image_captioning(pil_crop)
-                            vqa_question = "How many vehicles are visible in this image?"
-                            vqa_answer = vlm.vqa_question(pil_crop, vqa_question)
-                            
-                            self.log.emit(f"[DEBUG] BLIP-2 詳細分析: {detailed_result['full_response']}")
-                            self.log.emit(f"[DEBUG] Image Captioning: {caption}")
-                            self.log.emit(f"[DEBUG] VQA ({vqa_question}): {vqa_answer}")
-                            
-                            if detailed_result['is_illegal']:
-                                vlm_score = 0.8
-                            else:
-                                vlm_score = 0.2
-                        else:
-                            texts = ["The vehicle is illegally parked on a red line.", "The vehicle is parked legally."]
-                            scores = vlm.score_image_with_texts(pil_crop, texts)
-                            vlm_score = scores[texts[0]]
+                        # 強制執行 VQA 分析，不管 detailed_analysis 設定
+                        detailed_result = vlm.detailed_analysis(pil_crop)
+                        caption = vlm.image_captioning(pil_crop)
                         
-                        self.log.emit(f"[DEBUG] BLIP-2違規分數={vlm_score:.2f}")
+                        # 使用更適合的 VQA 問題來判斷違規
+                        vqa_question = "Is this vehicle parked illegally on a red line or in a no-parking zone?"
+                        vqa_answer = vlm.vqa_question(pil_crop, vqa_question)
+                        
+                        # 在 terminal 和 GUI 上顯示 VQA 摘要
+                        self.log.emit(f"[VQA] 圖像描述: {caption}")
+                        self.log.emit(f"[VQA] 違規問答: {vqa_answer}")
+                        self.log.emit(f"[VQA] 詳細分析: {detailed_result['full_response']}")
+                        
+                        # 綜合判斷違規分數：結合紅線重疊、VLM 分析和 VQA 問答
+                        base_score = 0.0
+                        
+                        # 1. 根據紅線重疊程度給基礎分數
+                        if overlapped:
+                            base_score += 0.4  # 紅線重疊基礎分數
+                            if ratio > 0.05:  # 重疊比例高
+                                base_score += 0.2
+                        else:
+                            base_score += 0.1  # 無重疊，低分
+                        
+                        # 2. 根據 VLM 詳細分析調整分數
+                        if detailed_result['is_illegal']:
+                            base_score += 0.3
+                        else:
+                            base_score -= 0.2
+                        
+                        # 3. 根據 VQA 問答結果調整分數
+                        vqa_lower = vqa_answer.lower()
+                        if any(word in vqa_lower for word in ['illegal', 'violation', 'no-parking', 'red line']):
+                            base_score += 0.2
+                        elif any(word in vqa_lower for word in ['legal', 'designated', 'parking spot']):
+                            base_score -= 0.2
+                        
+                        # 4. 確保分數在合理範圍內
+                        vlm_score = max(0.0, min(1.0, base_score))
+                        
+                        self.log.emit(f"[DEBUG] 綜合違規分數計算:")
+                        self.log.emit(f"  紅線重疊: {overlapped} (比例: {ratio:.3f})")
+                        self.log.emit(f"  VLM分析: {detailed_result['is_illegal']}")
+                        self.log.emit(f"  VQA答案: {vqa_answer}")
+                        self.log.emit(f"  最終分數: {vlm_score:.2f}")
+                        
+                        # 根據綜合分數判斷是否違規
                         if is_violation:
-                            is_violation = vlm_score > 0.3
+                            is_violation = vlm_score > 0.4  # 降低閾值，提高敏感度
                     except Exception as e:
                         self.log.emit(f"[WARNING] VLM 分析失敗: {e}")
                         vlm_score = None
@@ -221,8 +248,9 @@ class MainWindow(QWidget):
         btn_toggle_display = QPushButton("切換顯示模式")
         btn_toggle_display.clicked.connect(self.on_toggle_display)
 
-        self.detailed_checkbox = QCheckBox("啟用詳細分析 (BLIP-2 兩階段分析)")
-        self.detailed_checkbox.setChecked(self.detailed_analysis)
+        self.detailed_checkbox = QCheckBox("啟用詳細分析 (BLIP-2 兩階段分析) - 已強制啟用")
+        self.detailed_checkbox.setChecked(True)
+        self.detailed_checkbox.setEnabled(False)  # 禁用 checkbox，因為已強制啟用
         self.detailed_checkbox.toggled.connect(self.on_detailed_toggled)
 
         self.log_text = QTextEdit()
@@ -300,13 +328,35 @@ class MainWindow(QWidget):
     def on_detection_finished(self, flagged_list, out_path):
         if out_path:
             self.show_image(out_path)
+        
+        # 顯示分析完成訊息
+        self.log("=== 分析完成 ===")
+        
         if flagged_list:
-            self.log(f"完成：發現 {len(flagged_list)} 起違規")
-            if self.detailed_analysis:
-                for i, case in enumerate(flagged_list):
-                    self.log(f"違規 {i+1}: 車輛類型={case['cls']}, 置信度={case['conf']:.2f}, VLM分數={case['vlm_score']:.2f}")
+            self.log(f"發現 {len(flagged_list)} 起違規")
+            self.log("=== 違規詳細分析 ===")
+            
+            for i, case in enumerate(flagged_list):
+                self.log(f"違規 {i+1}:")
+                self.log(f"  車輛類型: {case['cls']}")
+                self.log(f"  YOLO置信度: {case['conf']:.2f}")
+                self.log(f"  VLM違規分數: {case['vlm_score']:.2f}")
+                
+                # 根據 VLM 分數判斷違規程度
+                if case['vlm_score'] >= 0.7:
+                    violation_level = "高度違規"
+                elif case['vlm_score'] >= 0.5:
+                    violation_level = "中度違規"
+                else:
+                    violation_level = "輕微違規"
+                
+                self.log(f"  違規程度: {violation_level}")
+                self.log("  ---")
         else:
-            self.log("完成：未發現違規")
+            self.log("未發現違規")
+            self.log("所有車輛都在合法停車區域")
+        
+        self.log("=== 分析結束 ===")
             
     def on_test_blip(self):
         if not self.source_path:
