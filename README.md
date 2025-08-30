@@ -49,7 +49,7 @@ cmd:
 
 3. 安裝需要的套件
 
-`pip install -r requirements.txt`
+`pip install -r Application\DebugVersion\requirements.txt`
 
 ---
 ### 執行與使用說明
