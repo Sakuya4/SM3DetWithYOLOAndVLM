@@ -48,170 +48,108 @@ OUTPUT_DIR.mkdir(exist_ok=True)
 
 
 class DetectionWorker(QThread):
-    """圖片偵測工作執行緒 - 使用新的模組化架構"""
     progress = Signal(int)
     log = Signal(str)
     finished = Signal(list, str)
 
-    def __init__(self, source_path, yolo_weights, vlm_enabled, debug_mask, detailed_analysis):
+    def __init__(self, source_path, yolo_weights, debug_mask):
         super().__init__()
         self.source_path = source_path
         self.yolo_weights = yolo_weights
-        self.vlm_enabled = False  # BLIP2VLM功能已註解
         self.debug_mask = debug_mask
-        self.detailed_analysis = detailed_analysis
-        
-        # 使用新的模組化功能
-        self.detector = UltralyticsDetector(yolo_weights)
-        self.image_processor = ImageProcessor()
+
+    def bbox_hits_redline(self, bbox, red_mask, band_px=30, min_ratio=0.005):
+        x1, y1, x2, y2 = map(int, bbox)
+        y2 = min(y2, red_mask.shape[0]-1)
+        y_top = max(y2 - band_px, 0)
+        strip = red_mask[y_top:y2+1, x1:x2+1]
+        if strip.size == 0:
+            return False, 0.0
+        red_pixels = cv2.countNonZero(strip)
+        ratio = red_pixels / strip.size
+        return ratio >= min_ratio, ratio
 
     def run(self):
         try:
-            self.log.emit("[INFO] 開始載入圖片...")
+            yolo = YOLO(self.yolo_weights)
+
             img = cv2.imread(str(self.source_path))
             if img is None:
                 self.log.emit("[ERROR] 無法讀取圖片")
                 self.finished.emit([], "")
                 return
-            
-            # 使用新的影像增強功能
-            self.log.emit("[INFO] 套用影像增強處理...")
-            img = enhance_red_line_detection(img)
-            self.log.emit("[INFO] 影像增強完成")
+
+            blurred = cv2.GaussianBlur(img, (0, 0), 3)
+            img = cv2.addWeighted(img, 1.5, blurred, -0.5, 0)
+            self.log.emit("[INFO] 已套用去模糊處理")
 
             self.log.emit("[INFO] 偵測紅線...")
-            red_mask = detect_red_lines(img)
+            mask = detect_red_lines(img)
 
             if self.debug_mask:
                 mask_path = OUTPUT_DIR / f"red_mask_{int(time.time())}.png"
-                cv2.imwrite(str(mask_path), red_mask)
+                cv2.imwrite(str(mask_path), mask)
                 self.log.emit(f"[DEBUG] 紅線遮罩已儲存: {mask_path}")
 
-            self.log.emit("[INFO] 執行車輛偵測...")
-            detections = self.detector.detect(img)
+            self.log.emit("[INFO] 執行 YOLO 偵測...")
+            results = yolo.predict(source=np.array(img), imgsz=640, conf=0.25, verbose=False)
+
+            detections = []
+            labels = {}
+            for r in results:
+                labels = getattr(r, 'names', labels)
+                if hasattr(r, 'boxes'):
+                    for box in r.boxes:
+                        xyxy = box.xyxy[0].cpu().numpy()
+                        conf = float(box.conf[0].cpu().numpy())
+                        cls = int(box.cls[0].cpu().numpy())
+                        detections.append((xyxy[0], xyxy[1], xyxy[2], xyxy[3], conf, cls))
 
             flagged = []
             out_img = img.copy()
-            
             for idx, det in enumerate(detections):
-                x1, y1, x2, y2 = det.x1, det.y1, det.x2, det.y2
-                conf = det.confidence
-                cls_name = det.class_name
-                
-                # 檢查是否壓到紅線
-                overlapped, ratio = bbox_hits_redline(
-                    (x1, y1, x2, y2), red_mask, band_px=30, min_ratio=0.005
-                )
-                
-                # 只根據紅線來判定違停，ROI 僅作為視覺標註
-                bbox = (x1, y1, x2, y2)
-                is_violation = overlapped and conf > 0.3
-                
-                # 使用新的影像處理器繪製車輛框
-                out_img = self.image_processor.draw_vehicle_box(
-                    out_img, bbox, cls_name, idx, conf, 0.0, is_violation
+                x1, y1, x2, y2, conf, cls = det
+                cls_name = labels.get(cls, str(cls)).lower()
+                crop = img[int(y1):int(y2), int(x1):int(x2)]
+                # === 過濾規則 ===
+                area = (x2 - x1) * (y2 - y1)
+                img_h, img_w = img.shape[:2]
+                # 忽略太小的框 (例如 5000 pixel 以下)
+                if area < 5000:
+                    self.log.emit(f"[DEBUG] 忽略小bbox: {cls_name}, area={area}")
+                    continue  
+
+                # 忽略在畫面上半部的框 (避免偵測到遠方車輛/行人)
+                if y2 < img_h * 0.5:
+                    self.log.emit(f"[DEBUG] 忽略遠方bbox: {cls_name}, y2={y2}")
+                    continue
+                # =================
+                overlapped, ratio = self.bbox_hits_redline(
+                    (x1, y1, x2, y2), mask, band_px=30, min_ratio=0.02
                 )
 
+                is_violation = overlapped and conf > 0.3
                 self.log.emit(f"[DEBUG] 車輛={cls_name}, conf={conf:.2f}, redline_ratio={ratio:.3f}, overlapped={overlapped}")
 
+                color = (0, 0, 255) if is_violation else (0, 255, 0)
+                cv2.rectangle(out_img, (int(x1), int(y1)), (int(x2), int(y2)), color, 2)
+
                 if is_violation:
-                    # 截取違停車輛圖片
-                    crop = img[y1:y2, x1:x2]
                     case_path = OUTPUT_DIR / f"case_{idx}_{int(time.time())}.jpg"
                     cv2.imwrite(str(case_path), crop)
-                    flagged.append({
-                        'cls': cls_name, 
-                        'conf': conf, 
-                        'bbox': bbox,
-                        'redline_overlap': overlapped,
-                        'redline_ratio': ratio
-                    })
+                    flagged.append({'cls': cls_name, 'conf': conf})
 
                 self.progress.emit(int((idx + 1) / max(1, len(detections)) * 100))
 
-            # 根據紅線位置智能設定 ROI
-            self.log.emit("[INFO] 根據紅線設定智能禁停區...")
-            roi_points = self._create_smart_roi_from_redlines(img, red_mask, None)
-            if roi_points:
-                self.image_processor.roi_manager.set_roi_points(roi_points)
-                self.log.emit(f"[INFO] 智能 ROI 已設定，包含 {len(roi_points)} 個點")
-            
-            # 在結果圖片上繪製 ROI 和紅線遮罩標註
-            self.log.emit("[INFO] 繪製 ROI 和標註...")
-            final_img = self.image_processor.draw_violation_annotations(
-                out_img, "static_analysis", "static", 1.0, 0.0, 
-                False, None, False, 0.0
-            )
-            
-            # 儲存結果圖片
             out_path = OUTPUT_DIR / f"out_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
-            cv2.imwrite(str(out_path), final_img)
-            
+            cv2.imwrite(str(out_path), out_img)
             self.finished.emit(flagged, str(out_path))
 
         except Exception as e:
-            self.log.emit(f"[ERROR] 偵測過程發生錯誤: {e}")
-            import traceback
-            self.log.emit(f"[ERROR] 詳細錯誤: {traceback.format_exc()}")
+            self.log.emit(f"[ERROR] {e}")
             self.finished.emit([], "")
 
-    def _create_smart_roi_from_redlines(self, frame, red_mask, bbox):
-        """根據紅線位置智能創建 ROI，只框住紅線附近的區域"""
-        try:
-            # 獲取紅線的輪廓
-            contours, _ = cv2.findContours(red_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            if not contours:
-                return None
-            
-            # 找到最大的紅線輪廓
-            largest_contour = max(contours, key=cv2.contourArea)
-            contour_area = cv2.contourArea(largest_contour)
-            
-            # 檢查紅線面積是否太小（可能是雜訊）
-            h_frame, w_frame = frame.shape[:2]
-            min_red_area = (h_frame * w_frame) // 1000  # 最小面積為影像的 0.1%
-            
-            if contour_area < min_red_area:
-                self.log.emit(f"[WARNING] 紅線面積過小 ({contour_area:.0f} < {min_red_area:.0f})，跳過 ROI 創建")
-                return None
-            
-            # 獲取紅線的邊界框
-            x, y, w, h = cv2.boundingRect(largest_contour)
-            
-            # 檢查紅線尺寸是否合理
-            if w < 20 or h < 20:  # 紅線寬度或高度小於 20 像素
-                self.log.emit(f"[WARNING] 紅線尺寸過小 (w={w}, h={h})，跳過 ROI 創建")
-                return None
-            
-            # 計算紅線的中心線
-            center_x = x + w // 2
-            center_y = y + h // 2
-            
-            # 創建一個沿著紅線方向的狹長 ROI
-            # 寬度：紅線寬度 + 100 像素（左右各 50 像素）
-            # 高度：紅線高度 + 60 像素（上下各 30 像素）
-            roi_width = max(w + 100, 150)  # 最小寬度 150 像素
-            roi_height = max(h + 60, 100)   # 最小高度 100 像素
-            
-            roi_x1 = max(0, center_x - roi_width // 2)
-            roi_y1 = max(0, center_y - roi_height // 2)
-            roi_x2 = min(w_frame, roi_x1 + roi_width)
-            roi_y2 = min(h_frame, roi_y1 + roi_height)
-            
-            # 創建 ROI 多邊形（矩形）
-            roi_points = [
-                [roi_x1, roi_y1],
-                [roi_x2, roi_y1],
-                [roi_x2, roi_y2],
-                [roi_x1, roi_y2]
-            ]
-            
-            self.log.emit(f"[INFO] 智能 ROI 創建成功: 中心點({center_x}, {center_y}), 尺寸({roi_width}x{roi_height})")
-            return roi_points
-            
-        except Exception as e:
-            self.log.emit(f"[ERROR] 創建智能 ROI 失敗: {e}")
-            return None
+    
 
 
 class WebcamStreamProcessor(QObject):
@@ -388,7 +326,7 @@ class WebcamStreamProcessor(QObject):
             
             # 5. 違停判定：主要根據紅線，ROI 作為輔助確認
             is_violation = red_line_violation and duration >= 30.0
-            
+
             # 5. 創建違停截圖（包含所有標註）
             violation_frame = self.image_processor.create_violation_frame(
                 frame, vehicle_id, vehicle_type, confidence, duration, extra_info
@@ -611,11 +549,9 @@ class MainWindow(QWidget):
         self.progress.setValue(0)
         
         self.worker = DetectionWorker(
-            self.source_path, 
-            self.yolo_weights, 
-            False,  # BLIP2VLM功能已註解
-            self.debug_mask,
-            False
+            self.source_path,
+            self.yolo_weights,
+            self.debug_mask
         )
         self.worker.progress.connect(self.progress.setValue)
         self.worker.log.connect(self.log)
@@ -636,8 +572,6 @@ class MainWindow(QWidget):
                 self.log(f"違規 {i+1}:")
                 self.log(f"  車輛類型: {case.get('cls', '未知')}")
                 self.log(f"  YOLO置信度: {case.get('conf', 0):.2f}")
-                self.log(f"  紅線重疊: {case.get('redline_overlap', False)}")
-                self.log(f"  紅線重疊比例: {case.get('redline_ratio', 0):.3f}")
                 self.log("  ---")
         else:
             self.log("未發現違規")

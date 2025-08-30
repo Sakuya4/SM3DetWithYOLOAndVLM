@@ -25,11 +25,12 @@ def detect_red_lines(img: np.ndarray) -> np.ndarray:
         
         # 更精確的紅色範圍 - 專注於道路紅線
         # 道路紅線通常有較高的飽和度和適中的亮度
-        lower_red1 = np.array([0, 140, 90])       # 低紅色 - 更高飽和度要求
-        upper_red1 = np.array([10, 255, 180])     # 高紅色 - 更嚴格的上限
+        lower_red1 = np.array([0, 100, 50])       # 低紅色 - 更高飽和度要求
+        upper_red1 = np.array([10, 255, 255])    # 高紅色 - 更嚴格的上限
         
-        lower_red2 = np.array([175, 140, 90])     # 低紅色 (接近 180 度)
-        upper_red2 = np.array([180, 255, 180])    # 高紅色 (接近 180 度)
+        
+        lower_red2 = np.array([170, 100, 50])    # 低紅色 (接近 180 度)
+        upper_red2 = np.array([180, 255, 255])    # 高紅色 (接近 180 度)
         
         # 創建兩個紅色遮罩
         mask1 = cv2.inRange(hsv, lower_red1, upper_red1)
@@ -55,10 +56,10 @@ def detect_red_lines(img: np.ndarray) -> np.ndarray:
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel_small, iterations=1)
         
         # 過濾：只保留符合紅線特徵的區域
-        mask = filter_red_line_features(mask, img.shape)
+        # mask = filter_red_line_features(mask, img.shape)
         
         # 最終優化：移除孤立的像素點
-        mask = remove_isolated_pixels(mask)
+        # mask = remove_isolated_pixels(mask)
         
         logger.info("紅線偵測完成 (精確版本)")
         return mask
